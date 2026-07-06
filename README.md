@@ -23,9 +23,18 @@ python3 analisar_processo_caged.py
 ```
 
 O script identifica cada PDF **pelo conteúdo** (não pelo nome): o que contém
-planilhas do PJe-Calc é tratado como processo e os que contêm vínculos
-(PIS/Nome) são tratados como CAGED — todos os CAGEDs são lidos e somados.
+planilhas do PJe-Calc (ou cabeçalhos do PJe/nº de processo CNJ) é tratado como
+processo e os que contêm vínculos (PIS/Nome) são tratados como CAGED/RAIS —
+todos são lidos e somados. A amostragem de identificação inclui as primeiras
+páginas, o meio, o fim e a região de `--pagina-inicial` do documento, pois em
+processos grandes as planilhas ficam longe do início.
 Para procurar em outra pasta: `--pasta /caminho/da/pasta`.
+
+Relatórios **RAIS anuais** (ex.: `RAIS-Relatorio-Completo-2020-CNPJ.pdf`) são
+suportados: o ano de referência é lido do conteúdo ou inferido do nome do
+arquivo, e a mesma pessoa presente em vários anos tem as entradas consolidadas
+(admissões/desligamentos comparados contra todas as entradas; remunerações
+comparadas ano a ano).
 
 ### Modo manual
 
