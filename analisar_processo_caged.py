@@ -106,8 +106,13 @@ class Reclamante:
     historico_salarial: dict = field(default_factory=dict)  # {'MM/AAAA': valor}
     verbas: dict = field(default_factory=dict)               # {nome: total}
     meses_cobrados: set = field(default_factory=set)         # {(ano, mes)}
+    # Ocorrências linha a linha do Demonstrativo de Verbas:
+    # {'verba', 'ano', 'mes', 'devido', 'corrigido'}
+    ocorrencias: list = field(default_factory=list)
+    custas: float = None
     total_bruto: float = None
     total_devido: float = None
+    verba_atual: str = None   # estado do parser (seção corrente do demonstrativo)
 
     @property
     def nome_norm(self) -> str:
@@ -162,6 +167,36 @@ class Inconsistencia:
     valor_processo: str = ""
     valor_caged: str = ""
     paginas: str = ""
+    valor_estimado: float = None   # impacto estimado em R$ (quando quantificável)
+
+
+def marco_prescricional(ajuizamento):
+    """Marco da prescrição quinquenal: data do ajuizamento menos 5 anos."""
+    if not ajuizamento:
+        return None
+    try:
+        return ajuizamento.replace(year=ajuizamento.year - 5)
+    except ValueError:  # 29/02
+        return ajuizamento.replace(year=ajuizamento.year - 5, day=28)
+
+
+def avos_no_ano(admissao, demissao, ano):
+    """Nº de avos (meses com >= 15 dias trabalhados) do contrato no ano civil,
+    critério da Súmula 451/TST para proporcionalidade da PLR."""
+    from calendar import monthrange
+    from datetime import date, timedelta
+    ini = max(admissao or date(ano, 1, 1), date(ano, 1, 1))
+    fim = min(demissao or date(ano, 12, 31), date(ano, 12, 31))
+    if fim < ini:
+        return 0
+    avos = 0
+    for mes in range(1, 13):
+        m_ini = date(ano, mes, 1)
+        m_fim = date(ano, mes, monthrange(ano, mes)[1])
+        dias = (min(fim, m_fim) - max(ini, m_ini)).days + 1
+        if dias >= 15:
+            avos += 1
+    return avos
 
 
 # ---------------------------------------------------------------------------
@@ -270,10 +305,53 @@ def _preencher_reclamante(r: Reclamante, texto: str):
                 if not re.match(rf"^\d{{2}}/\d{{4}}", linha.strip()):
                     em_historico = False
 
-    # Meses cobrados nas verbas: "22 a 28/02/2021 ..." / "01 a 27/04/2021 ..."
-    for m in re.finditer(rf"^\d{{2}} a \d{{2}}/(\d{{2}})/(\d{{4}})\s",
-                         texto, re.MULTILINE):
-        r.meses_cobrados.add((int(m.group(2)), int(m.group(1))))
+    # Ocorrências do Demonstrativo de Verbas, linha a linha, com a seção
+    # (verba) corrente. Formato: "22 a 28/02/2021 <base> <divisor> <mult>
+    # <qtd> <dobra> <devido> <pago> <diferença> <índice> <corrigido>"
+    # (campos ausentes vêm como "-", ex.: PLR).
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        m_nome = re.match(r"^Nome:\s*(.+)$", linha)
+        if m_nome:
+            nome_secao = m_nome.group(1).strip()
+            if any(p in nome_secao.upper() for p in
+                   ("JUROS", "HONORÁRIOS", "HONORARIOS", "CUSTAS")):
+                r.verba_atual = None      # seções que não são verbas
+            else:
+                r.verba_atual = nome_secao
+            continue
+        if re.match(r"^Demonstrativo de (Juros|Honor|Custas)", linha):
+            r.verba_atual = None
+            continue
+        m_oc = re.match(rf"^(\d{{2}}) a (\d{{2}})/(\d{{2}})/(\d{{4}})\s+(.+)$",
+                        linha)
+        if m_oc and r.verba_atual:
+            ano, mes = int(m_oc.group(4)), int(m_oc.group(3))
+            r.meses_cobrados.add((ano, mes))
+            tokens = m_oc.group(5).split()
+            if len(tokens) >= 10:
+                try:
+                    devido = parse_valor(tokens[5])
+                    corrigido = parse_valor(tokens[9])
+                except ValueError:
+                    continue
+                r.ocorrencias.append({
+                    "verba": r.verba_atual, "ano": ano, "mes": mes,
+                    "devido": devido, "corrigido": corrigido,
+                })
+
+    # Custas judiciais da planilha
+    if r.custas is None:
+        m = re.search(
+            rf"CUSTAS JUDICIAIS DEVIDAS PELO RECLAMADO\s+({RE_VALOR})", texto)
+        if m:
+            r.custas = parse_valor(m.group(1))
+    if r.custas is None:
+        m = re.search(
+            rf"DIFERENÇA DE CUSTAS DO RECLAMADO[\s\S]*?{RE_DATA}\s+({RE_VALOR})\s+{RE_VALOR}\s+{RE_VALOR}",
+            texto)
+        if m:
+            r.custas = parse_valor(m.group(1))
 
     # Totais das verbas no Resumo do Cálculo:
     # "MULTA CONVENCIONAL 604,15 109,16 713,31"
@@ -428,19 +506,36 @@ def escolher_vinculo(reclamante, candidatos):
     return max(candidatos, key=sobreposicao)
 
 
-def verificar(reclamantes, vinculos, tolerancia_salario=0.05, log=print):
+def verificar(reclamantes, vinculos, tolerancia_salario=0.05,
+              valor_plr_cheio=400.0, custas_fixas=None, inicio_titulo=None,
+              lista_reclamantes=None, log=print):
     inconsistencias = []
 
-    def add(rec, tipo, gravidade, descricao, vp="", vc=""):
+    def add(rec, tipo, gravidade, descricao, vp="", vc="", estimado=None):
         pags = ""
-        if rec.fls:
-            pags = f"Fls. {min(rec.fls)}-{max(rec.fls)}"
-        elif rec.paginas_pdf:
-            pags = f"pág. PDF {min(rec.paginas_pdf)}-{max(rec.paginas_pdf)}"
+        if rec is not None:
+            if rec.fls:
+                pags = f"Fls. {min(rec.fls)}-{max(rec.fls)}"
+            elif rec.paginas_pdf:
+                pags = f"pág. PDF {min(rec.paginas_pdf)}-{max(rec.paginas_pdf)}"
         inconsistencias.append(Inconsistencia(
-            reclamante=rec.nome or f"(cálculo {rec.numero_calculo})",
+            reclamante=(rec.nome or f"(cálculo {rec.numero_calculo})")
+                       if rec is not None else "(GERAL)",
             tipo=tipo, gravidade=gravidade, descricao=descricao,
-            valor_processo=str(vp), valor_caged=str(vc), paginas=pags))
+            valor_processo=str(vp), valor_caged=str(vc), paginas=pags,
+            valor_estimado=round(estimado, 2) if estimado else None))
+
+    # Item 4 da auditoria: reclamantes da lista sem memória de cálculo
+    if lista_reclamantes:
+        nomes_planilhas = {r.nome_norm for r in reclamantes}
+        for nome in lista_reclamantes:
+            if normalizar_nome(nome) not in nomes_planilhas:
+                inconsistencias.append(Inconsistencia(
+                    reclamante=nome, gravidade="CRÍTICA",
+                    tipo="SEM MEMÓRIA DE CÁLCULO INDIVIDUALIZADA",
+                    descricao="Reclamante consta da lista, mas não foi "
+                              "localizada planilha de cálculo individualizada "
+                              "no intervalo de páginas analisado."))
 
     # 8) Duplicidade de planilhas
     vistos = {}
@@ -468,6 +563,109 @@ def verificar(reclamantes, vinculos, tolerancia_salario=0.05, log=print):
                 "informada na planilha.",
                 f"fim {fmt_data(rec.periodo_fim)}",
                 f"demissão (planilha) {fmt_data(rec.demissao)}")
+
+        # ---- Verificações da auditoria dos cálculos de liquidação ----
+        marco = marco_prescricional(rec.data_ajuizamento)
+
+        # Auditoria item 2: crédito integralmente prescrito
+        # (desligamento anterior ao marco quinquenal)
+        if marco and rec.demissao and rec.demissao < marco:
+            add(rec, "CRÉDITO INTEGRALMENTE PRESCRITO", "CRÍTICA",
+                f"Demissão anterior ao marco prescricional quinquenal "
+                f"({fmt_data(marco)}, art. 7º, XXIX, CF; art. 11, CLT). "
+                "Todo o crédito estaria prescrito.",
+                f"demissão {fmt_data(rec.demissao)}",
+                f"marco {fmt_data(marco)}",
+                estimado=rec.total_devido or rec.total_bruto)
+
+        # Auditoria item 1: competências prescritas / fora do título executivo
+        if marco:
+            prescritas = [o for o in rec.ocorrencias
+                          if datetime(o["ano"], o["mes"], 1).date() < marco
+                          and datetime(o["ano"], o["mes"], 28).date() < marco]
+            if prescritas and not (rec.demissao and rec.demissao < marco):
+                comps = sorted({(o["ano"], o["mes"]) for o in prescritas})
+                add(rec, "COMPETÊNCIAS PRESCRITAS NO CÁLCULO", "CRÍTICA",
+                    f"{len(prescritas)} lançamento(s) de verbas em competências "
+                    f"anteriores ao marco prescricional ({fmt_data(marco)}): "
+                    + ", ".join(f"{m:02d}/{a}" for a, m in comps) + ".",
+                    estimado=sum(o["corrigido"] for o in prescritas))
+        if inicio_titulo:
+            fora_titulo = [o for o in rec.ocorrencias
+                           if datetime(o["ano"], o["mes"], 28).date()
+                           < inicio_titulo]
+            if fora_titulo:
+                comps = sorted({(o["ano"], o["mes"]) for o in fora_titulo})
+                add(rec, "COBRANÇA FORA DO TÍTULO EXECUTIVO", "CRÍTICA",
+                    f"{len(fora_titulo)} lançamento(s) em competências "
+                    f"anteriores ao período coberto pela sentença "
+                    f"(início {fmt_data(inicio_titulo)}): "
+                    + ", ".join(f"{m:02d}/{a}" for a, m in comps)
+                    + ". Pode haver sobreposição com a prescrição.",
+                    estimado=sum(o["corrigido"] for o in fora_titulo))
+
+        # Auditoria item 3a: PLR sem proporcionalidade (Súmula 451/TST)
+        plr_prop_corrigida = 0.0
+        for o in rec.ocorrencias:
+            if "PLR" not in o["verba"].upper() and \
+                    "PARTICIPAÇÃO" not in o["verba"].upper():
+                continue
+            avos = avos_no_ano(rec.admissao, rec.demissao, o["ano"])
+            if avos >= 12 or avos == 0:
+                plr_prop_corrigida += o["corrigido"]
+                continue
+            proporcional = round(valor_plr_cheio / 12.0 * avos, 2)
+            plr_prop_corrigida += o["corrigido"] * proporcional / o["devido"] \
+                if o["devido"] else 0.0
+            if abs(o["devido"] - valor_plr_cheio) <= 0.01:
+                excesso = o["corrigido"] * (o["devido"] - proporcional) \
+                    / o["devido"]
+                add(rec, "PLR SEM PROPORCIONALIDADE (AVOS)", "ALTA",
+                    f"PLR de {o['mes']:02d}/{o['ano']} lançada pelo valor "
+                    f"cheio de {valor_plr_cheio:.2f}, mas o contrato tem "
+                    f"apenas {avos}/12 avos no ano (Súmula 451/TST). "
+                    f"Valor proporcional devido: {proporcional:.2f}.",
+                    f"devido {o['devido']:.2f}",
+                    f"proporcional {proporcional:.2f}",
+                    estimado=excesso)
+
+        # Auditoria item 3b: multa convencional acima do teto (art. 412 CC)
+        multa_corrigida = sum(o["corrigido"] for o in rec.ocorrencias
+                              if "MULTA" in o["verba"].upper())
+        if multa_corrigida and plr_prop_corrigida and \
+                multa_corrigida > plr_prop_corrigida + 0.01:
+            add(rec, "MULTA ACIMA DO TETO (ART. 412 CC)", "ALTA",
+                "A multa convencional corrigida supera o valor da obrigação "
+                "principal (PLR recomposta proporcionalmente) — cláusula "
+                "penal não pode exceder a obrigação principal (art. 412 CC; "
+                "OJ 54 SBDI-1/TST). Conferir base da obrigação principal.",
+                f"multa corrigida {multa_corrigida:.2f}",
+                f"obrigação principal {plr_prop_corrigida:.2f}",
+                estimado=multa_corrigida - plr_prop_corrigida)
+
+        # Auditoria item 3c: fragmentação (mesma competência lançada 2x)
+        contagem = {}
+        for o in rec.ocorrencias:
+            chave = (o["verba"].upper(), o["ano"], o["mes"])
+            contagem.setdefault(chave, []).append(o)
+        for (verba, ano, mes), ocs in contagem.items():
+            if len(ocs) > 1:
+                add(rec, "FRAGMENTAÇÃO DE COMPETÊNCIA", "ALTA",
+                    f"A verba '{verba}' da competência {mes:02d}/{ano} foi "
+                    f"lançada {len(ocs)} vezes na mesma planilha — possível "
+                    "cobrança em duplicidade no mesmo ciclo.",
+                    f"{len(ocs)} lançamentos",
+                    estimado=sum(o["corrigido"] for o in ocs[1:]))
+
+        # Auditoria item 5: custas recalculadas por cálculo (aponta cada
+        # planilha; o excesso total é quantificado numa única entrada geral)
+        if custas_fixas is not None and rec.custas:
+            add(rec, "CUSTAS RECALCULADAS POR CÁLCULO", "MÉDIA",
+                f"A planilha recalcula custas de {rec.custas:.2f} (2% por "
+                f"cálculo), mas a sentença fixou custas em valor único de "
+                f"{custas_fixas:.2f} para o processo.",
+                f"custas na planilha {rec.custas:.2f}",
+                f"custas fixadas {custas_fixas:.2f}")
 
         # 11) Soma das verbas x total do resumo
         if rec.verbas and rec.total_bruto is not None:
@@ -554,6 +752,19 @@ def verificar(reclamantes, vinculos, tolerancia_salario=0.05, log=print):
                     "registrado).",
                     f"mês cobrado {mm:02d}/{aaaa}", "remuneração CAGED 0,00")
 
+    # Auditoria item 5 (consolidado): excesso total de custas do processo
+    if custas_fixas is not None:
+        total_custas = sum(r.custas or 0.0 for r in reclamantes)
+        if total_custas > custas_fixas:
+            add(None, "EXCESSO TOTAL DE CUSTAS DO PROCESSO", "ALTA",
+                f"Somadas, as custas recalculadas nas planilhas totalizam "
+                f"{total_custas:.2f}, mas a sentença fixou "
+                f"{custas_fixas:.2f} fixos — excesso de "
+                f"{total_custas - custas_fixas:.2f}.",
+                f"soma das planilhas {total_custas:.2f}",
+                f"fixado na sentença {custas_fixas:.2f}",
+                estimado=total_custas - custas_fixas)
+
     return inconsistencias
 
 
@@ -576,7 +787,8 @@ def gerar_relatorios(reclamantes, vinculos, inconsistencias, paginas_sem_texto,
         "Tipo": i.tipo,
         "Descrição": i.descricao,
         "Valor no Processo": i.valor_processo,
-        "Valor no CAGED": i.valor_caged,
+        "Referência (CAGED/legal)": i.valor_caged,
+        "Impacto Estimado (R$)": i.valor_estimado,
         "Localização no Processo": i.paginas,
     } for i in inconsistencias])
 
@@ -650,6 +862,15 @@ def gerar_relatorios(reclamantes, vinculos, inconsistencias, paginas_sem_texto,
     for g in ("CRÍTICA", "ALTA", "MÉDIA", "INFORMATIVA"):
         if g in por_grav:
             linhas.append(f"  {g:12s}: {por_grav[g]}")
+    total_estimado = sum(i.valor_estimado or 0.0 for i in inconsistencias)
+    if total_estimado:
+        linhas.append("")
+        linhas.append(f"IMPACTO TOTAL ESTIMADO (itens quantificáveis): "
+                      f"R$ {total_estimado:,.2f}".replace(",", "X")
+                      .replace(".", ",").replace("X", "."))
+        linhas.append("(Atenção: pode haver sobreposição entre itens — p.ex. "
+                      "competência prescrita E fora do título. Confira antes "
+                      "de somar na impugnação.)")
     linhas.append("")
     atual = None
     for i in inconsistencias:
@@ -661,7 +882,9 @@ def gerar_relatorios(reclamantes, vinculos, inconsistencias, paginas_sem_texto,
         linhas.append(f"      {i.descricao}")
         if i.valor_processo or i.valor_caged:
             linhas.append(f"      Processo: {i.valor_processo} | "
-                          f"CAGED: {i.valor_caged}")
+                          f"Referência: {i.valor_caged}")
+        if i.valor_estimado:
+            linhas.append(f"      Impacto estimado: R$ {i.valor_estimado:.2f}")
     if not inconsistencias:
         linhas.append("Nenhuma inconsistência encontrada com os critérios atuais.")
     with open(saida_txt, "w", encoding="utf-8") as f:
@@ -689,7 +912,28 @@ def main():
                     help="Arquivo Excel de saída")
     ap.add_argument("--tolerancia-salario", type=float, default=0.05,
                     help="Tolerância (fração) para divergência salarial")
+    ap.add_argument("--valor-plr-cheio", type=float, default=400.00,
+                    help="Valor cheio da PLR previsto na norma coletiva, para "
+                         "o teste de proporcionalidade (Súmula 451/TST)")
+    ap.add_argument("--custas-fixas", type=float, default=None,
+                    help="Valor de custas fixado na sentença (ex.: 2000). Se "
+                         "informado, aponta planilhas que recalculam custas")
+    ap.add_argument("--inicio-titulo", default=None, metavar="DD/MM/AAAA",
+                    help="Data inicial do período coberto pelo título "
+                         "executivo (ex.: início da CCT 2019/2020). Se "
+                         "informada, aponta cobranças anteriores a ela")
+    ap.add_argument("--lista-reclamantes", default=None, metavar="ARQUIVO",
+                    help="Arquivo texto com um nome de reclamante por linha; "
+                         "aponta quem não tem planilha individualizada")
     args = ap.parse_args()
+
+    inicio_titulo = parse_data(args.inicio_titulo) if args.inicio_titulo else None
+    if args.inicio_titulo and not inicio_titulo:
+        raise SystemExit("ERRO: --inicio-titulo deve estar no formato DD/MM/AAAA")
+    lista_nomes = None
+    if args.lista_reclamantes:
+        with open(args.lista_reclamantes, encoding="utf-8") as f:
+            lista_nomes = [ln.strip() for ln in f if ln.strip()]
 
     saida_txt = re.sub(r"\.xlsx?$", "", args.saida) + ".txt"
 
@@ -707,7 +951,11 @@ def main():
 
     print("[3/4] Cruzando dados e verificando inconsistências...")
     inconsistencias = verificar(reclamantes, vinculos,
-                                tolerancia_salario=args.tolerancia_salario)
+                                tolerancia_salario=args.tolerancia_salario,
+                                valor_plr_cheio=args.valor_plr_cheio,
+                                custas_fixas=args.custas_fixas,
+                                inicio_titulo=inicio_titulo,
+                                lista_reclamantes=lista_nomes)
     print(f"  -> {len(inconsistencias)} inconsistência(s) encontrada(s).")
 
     print("[4/4] Gerando relatórios...")
