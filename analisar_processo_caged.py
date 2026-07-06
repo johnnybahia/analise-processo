@@ -139,6 +139,7 @@ class VinculoCaged:
     aviso_previo: float = None
     ferias_indenizadas: float = None
     pagina_pdf: int = None
+    arquivo: str = ""
 
     @property
     def nome_norm(self) -> str:
@@ -197,6 +198,71 @@ def avos_no_ano(admissao, demissao, ano):
         if dias >= 15:
             avos += 1
     return avos
+
+
+# ---------------------------------------------------------------------------
+# Descoberta automática dos PDFs na pasta
+# ---------------------------------------------------------------------------
+
+def classificar_pdfs(pasta, log=print):
+    """Vasculha a pasta, classifica cada PDF pelo conteúdo (não pelo nome) e
+    retorna (caminho_do_processo, [caminhos_dos_cageds], [ignorados])."""
+    import os
+
+    pdfs = sorted(f for f in os.listdir(pasta)
+                  if f.lower().endswith(".pdf"))
+    if not pdfs:
+        raise SystemExit(f"ERRO: nenhum PDF encontrado na pasta '{pasta}'.")
+
+    processos = []   # (caminho, total_paginas)
+    cageds = []
+    ignorados = []
+
+    log(f"  Encontrado(s) {len(pdfs)} PDF(s) na pasta '{pasta}'; "
+        "classificando pelo conteúdo...")
+    for nome in pdfs:
+        caminho = os.path.join(pasta, nome)
+        try:
+            with pdfplumber.open(caminho) as pdf:
+                total = len(pdf.pages)
+                # Amostra: primeiras 5 páginas com texto
+                amostra = ""
+                for pagina in pdf.pages[:5]:
+                    amostra += (pagina.extract_text() or "") + "\n"
+        except Exception as e:
+            log(f"    AVISO: não foi possível ler '{nome}' ({e}); ignorado.")
+            ignorados.append(nome)
+            continue
+
+        a = amostra.upper()
+        if "PLANILHA DE CÁLCULO" in a or "PJE-CALC" in a:
+            processos.append((caminho, total))
+            log(f"    [PROCESSO] {nome} ({total} pág.)")
+        elif re.search(r"PIS:\s*[\d.\-]+\s*NOME:", a) or "VÍNCULOS" in a \
+                or "VINCULOS" in a:
+            cageds.append(caminho)
+            log(f"    [CAGED]    {nome} ({total} pág.)")
+        else:
+            ignorados.append(nome)
+            log(f"    [ignorado] {nome} (não parece planilha de cálculo "
+                "nem extrato CAGED)")
+
+    if not processos:
+        raise SystemExit("ERRO: nenhum PDF com planilhas de cálculo "
+                         "(PJe-Calc) foi identificado na pasta.")
+    if not cageds:
+        raise SystemExit("ERRO: nenhum PDF de extrato CAGED foi "
+                         "identificado na pasta.")
+
+    # Se houver mais de um candidato a processo, usa o de maior nº de páginas
+    processos.sort(key=lambda x: -x[1])
+    processo = processos[0][0]
+    if len(processos) > 1:
+        log(f"    AVISO: {len(processos)} PDFs parecem ser o processo; "
+            f"usando o maior: '{processos[0][0]}'. Os demais foram ignorados: "
+            + ", ".join(p for p, _ in processos[1:]))
+
+    return processo, cageds, ignorados
 
 
 # ---------------------------------------------------------------------------
@@ -379,13 +445,25 @@ def _preencher_reclamante(r: Reclamante, texto: str):
 # Parser do CAGED
 # ---------------------------------------------------------------------------
 
-def extrair_vinculos_caged(caminho_pdf, log=print):
-    """Extrai todos os vínculos do extrato CAGED."""
+def extrair_vinculos_caged(caminhos, log=print):
+    """Extrai todos os vínculos de um ou mais PDFs de extrato CAGED."""
+    if isinstance(caminhos, str):
+        caminhos = [caminhos]
+    vinculos = []
+    for caminho in caminhos:
+        vinculos.extend(_extrair_vinculos_um_pdf(caminho, log=log))
+    return vinculos
+
+
+def _extrair_vinculos_um_pdf(caminho_pdf, log=print):
+    """Extrai os vínculos de um único PDF de extrato CAGED."""
+    import os
+    nome_arquivo = os.path.basename(caminho_pdf)
     vinculos = []
     texto_total = []
 
     with pdfplumber.open(caminho_pdf) as pdf:
-        log(f"  PDF do CAGED tem {len(pdf.pages)} páginas; lendo todas...")
+        log(f"  '{nome_arquivo}' tem {len(pdf.pages)} página(s); lendo...")
         for num, pagina in enumerate(pdf.pages, start=1):
             t = pagina.extract_text() or ""
             texto_total.append((num, t))
@@ -408,7 +486,8 @@ def extrair_vinculos_caged(caminho_pdf, log=print):
             continue
         v = VinculoCaged(pis=m_pis.group(1).strip(),
                          nome=m_pis.group(2).strip(),
-                         ano_referencia=ano_ref_global)
+                         ano_referencia=ano_ref_global,
+                         arquivo=nome_arquivo)
 
         m_pg = re.search(r"\x0c(\d+)\n", bloco)
         if m_pg:
@@ -824,6 +903,7 @@ def gerar_relatorios(reclamantes, vinculos, inconsistencias, paginas_sem_texto,
             f"{m:02d}={val:.2f}" for m, val in sorted(v.remuneracoes.items())),
         "CBO": v.cbo,
         "Pág. PDF": v.pagina_pdf,
+        "Arquivo": v.arquivo,
     } for v in vinculos])
 
     with pd.ExcelWriter(saida_xlsx, engine="openpyxl") as writer:
@@ -902,8 +982,15 @@ def main():
         description="Cruza planilhas de cálculo do processo (PJe-Calc) com o "
                     "extrato CAGED e aponta inconsistências.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("processo", help="PDF do processo (planilhas de cálculo)")
-    ap.add_argument("caged", help="PDF do extrato CAGED")
+    ap.add_argument("processo", nargs="?", default=None,
+                    help="PDF do processo (planilhas de cálculo). Se omitido, "
+                         "a pasta é vasculhada e os PDFs são identificados "
+                         "automaticamente pelo conteúdo")
+    ap.add_argument("caged", nargs="*", default=None,
+                    help="PDF(s) do extrato CAGED (pode passar vários). Se "
+                         "omitido, todos os CAGEDs da pasta são usados")
+    ap.add_argument("--pasta", default=".",
+                    help="Pasta onde procurar os PDFs no modo automático")
     ap.add_argument("--pagina-inicial", type=int, default=351,
                     help="Primeira página do PDF do processo a ler")
     ap.add_argument("--pagina-final", type=int, default=1142,
@@ -937,16 +1024,30 @@ def main():
 
     saida_txt = re.sub(r"\.xlsx?$", "", args.saida) + ".txt"
 
+    # Modo automático: sem argumentos, identifica os PDFs da pasta
+    arq_processo = args.processo
+    arqs_caged = list(args.caged) if args.caged else []
+    if not arq_processo or not arqs_caged:
+        print("[0/4] Identificando PDFs automaticamente...")
+        processo_auto, cageds_auto, _ = classificar_pdfs(args.pasta)
+        if not arq_processo:
+            arq_processo = processo_auto
+        if not arqs_caged:
+            # Não usar o mesmo arquivo do processo como CAGED
+            arqs_caged = [c for c in cageds_auto if c != arq_processo]
+        if not arqs_caged:
+            raise SystemExit("ERRO: nenhum PDF de CAGED identificado.")
+
     print("[1/4] Lendo planilhas de cálculo do processo...")
     reclamantes, paginas_sem_texto = extrair_reclamantes(
-        args.processo, args.pagina_inicial, args.pagina_final)
+        arq_processo, args.pagina_inicial, args.pagina_final)
     print(f"  -> {len(reclamantes)} planilha(s) de cálculo extraída(s).")
     if paginas_sem_texto:
         print(f"  ATENÇÃO: {len(paginas_sem_texto)} página(s) sem texto "
               "extraível — provavelmente escaneadas; rode OCR nelas.")
 
-    print("[2/4] Lendo vínculos do CAGED...")
-    vinculos = extrair_vinculos_caged(args.caged)
+    print(f"[2/4] Lendo vínculos do CAGED ({len(arqs_caged)} arquivo(s))...")
+    vinculos = extrair_vinculos_caged(arqs_caged)
     print(f"  -> {len(vinculos)} vínculo(s) extraído(s).")
 
     print("[3/4] Cruzando dados e verificando inconsistências...")

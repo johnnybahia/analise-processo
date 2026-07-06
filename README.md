@@ -13,18 +13,30 @@ pip install -r requirements.txt
 
 ## Uso
 
+### Modo automático (recomendado)
+
+Coloque o PDF do processo e **todos** os PDFs de CAGED na mesma pasta do
+script e rode **sem argumentos**:
+
 ```bash
-python3 analisar_processo_caged.py PROCESSO.pdf CAGED.pdf \
+python3 analisar_processo_caged.py
+```
+
+O script identifica cada PDF **pelo conteúdo** (não pelo nome): o que contém
+planilhas do PJe-Calc é tratado como processo e os que contêm vínculos
+(PIS/Nome) são tratados como CAGED — todos os CAGEDs são lidos e somados.
+Para procurar em outra pasta: `--pasta /caminho/da/pasta`.
+
+### Modo manual
+
+```bash
+python3 analisar_processo_caged.py PROCESSO.pdf CAGED1.pdf CAGED2.pdf ... \
     --pagina-inicial 351 --pagina-final 1142 \
     --saida relatorio_inconsistencias.xlsx
 ```
 
 Os valores padrão de `--pagina-inicial` e `--pagina-final` já são 351 e 1142,
-então para o processo completo basta:
-
-```bash
-python3 analisar_processo_caged.py processo_completo.pdf caged_completo.pdf
-```
+então normalmente basta rodar sem esses parâmetros.
 
 Saídas geradas:
 
@@ -78,6 +90,7 @@ relatório em texto apresenta o **impacto total estimado** — compare com o
 
 | Opção | Padrão | Descrição |
 |-------|--------|-----------|
+| `--pasta` | `.` | Pasta onde procurar os PDFs no modo automático |
 | `--pagina-inicial` | 351 | Primeira página do PDF do processo a ler |
 | `--pagina-final` | 1142 | Última página do PDF do processo a ler |
 | `--saida` | `relatorio_inconsistencias.xlsx` | Arquivo Excel de saída |
