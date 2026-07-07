@@ -204,9 +204,13 @@ def avos_no_ano(admissao, demissao, ano):
 # Descoberta automática dos PDFs na pasta
 # ---------------------------------------------------------------------------
 
-def classificar_pdfs(pasta, log=print):
+def classificar_pdfs(pasta, pagina_inicial=None, log=print):
     """Vasculha a pasta, classifica cada PDF pelo conteúdo (não pelo nome) e
-    retorna (caminho_do_processo, [caminhos_dos_cageds], [ignorados])."""
+    retorna (caminho_do_processo, [caminhos_dos_cageds], [ignorados]).
+
+    A amostragem inclui as primeiras páginas, o meio do documento e a região
+    de `pagina_inicial` — as planilhas de cálculo costumam estar no fim de um
+    processo grande, longe das páginas iniciais."""
     import os
 
     pdfs = sorted(f for f in os.listdir(pasta)
@@ -225,27 +229,51 @@ def classificar_pdfs(pasta, log=print):
         try:
             with pdfplumber.open(caminho) as pdf:
                 total = len(pdf.pages)
-                # Amostra: primeiras 5 páginas com texto
+                # Amostra: primeiras páginas + meio + região das planilhas
+                indices = set(range(min(5, total)))
+                indices.add(total // 2)
+                indices.add(total - 1)
+                if pagina_inicial and total >= pagina_inicial:
+                    indices.update({pagina_inicial - 1,
+                                    min(pagina_inicial, total - 1),
+                                    min(pagina_inicial + 1, total - 1)})
                 amostra = ""
-                for pagina in pdf.pages[:5]:
-                    amostra += (pagina.extract_text() or "") + "\n"
+                for i in sorted(indices):
+                    amostra += (pdf.pages[i].extract_text() or "") + "\n"
         except Exception as e:
             log(f"    AVISO: não foi possível ler '{nome}' ({e}); ignorado.")
             ignorados.append(nome)
             continue
 
         a = amostra.upper()
-        if "PLANILHA DE CÁLCULO" in a or "PJE-CALC" in a:
+        eh_processo = (
+            "PLANILHA DE CÁLCULO" in a or "PJE-CALC" in a
+            or "PODER JUDICIÁRIO" in a or "JUSTIÇA DO TRABALHO" in a
+            # nº de processo judicial no padrão CNJ: 0000000-00.0000.0.00.0000
+            or re.search(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}", a)
+        )
+        if eh_processo:
             processos.append((caminho, total))
             log(f"    [PROCESSO] {nome} ({total} pág.)")
         elif re.search(r"PIS:\s*[\d.\-]+\s*NOME:", a) or "VÍNCULOS" in a \
-                or "VINCULOS" in a:
+                or "VINCULOS" in a or re.search(r"\bRAIS\b", a):
             cageds.append(caminho)
             log(f"    [CAGED]    {nome} ({total} pág.)")
         else:
             ignorados.append(nome)
             log(f"    [ignorado] {nome} (não parece planilha de cálculo "
-                "nem extrato CAGED)")
+                "nem extrato CAGED/RAIS)")
+
+    # Fallback: nenhum processo identificado, mas sobrou exatamente um PDF
+    # não classificado — assume que é o processo (pode ser escaneado/sem
+    # texto nas páginas amostradas).
+    if not processos and len(ignorados) == 1:
+        nome = ignorados.pop()
+        caminho = os.path.join(pasta, nome)
+        log(f"    AVISO: assumindo que '{nome}' é o processo (único PDF não "
+            "classificado). Se as páginas das planilhas estiverem sem texto, "
+            "será necessário OCR.")
+        processos.append((caminho, 0))
 
     if not processos:
         raise SystemExit("ERRO: nenhum PDF com planilhas de cálculo "
@@ -475,6 +503,15 @@ def _extrair_vinculos_um_pdf(caminho_pdf, log=print):
         if m:
             ano_ref_global = int(m.group(1))
             break
+    # Senão, tenta o ano no nome do arquivo (ex.: RAIS-Relatorio-Completo-
+    # 2020-<CNPJ>.pdf). Exige o ano isolado, sem dígitos colados (para não
+    # confundir com trechos do CNPJ).
+    if ano_ref_global is None:
+        m = re.search(r"(?<!\d)(19[89]\d|20[0-4]\d)(?!\d)", nome_arquivo)
+        if m:
+            ano_ref_global = int(m.group(1))
+            log(f"    Ano de referência de '{nome_arquivo}' inferido do "
+                f"nome do arquivo: {ano_ref_global}")
 
     texto_junto = "\n".join(f"\x0c{num}\n{t}" for num, t in texto_total)
 
@@ -775,44 +812,75 @@ def verificar(reclamantes, vinculos, tolerancia_salario=0.05,
 
         v = escolher_vinculo(rec, candidatos)
 
-        # 2) Admissão divergente
-        if rec.admissao and v.admissao and rec.admissao != v.admissao:
-            dias = abs((rec.admissao - v.admissao).days)
-            add(rec, "ADMISSÃO DIVERGENTE", "ALTA" if dias > 5 else "MÉDIA",
-                f"Data de admissão do processo difere do CAGED em {dias} dia(s).",
-                fmt_data(rec.admissao), fmt_data(v.admissao))
+        # Nos relatórios RAIS anuais a mesma pessoa aparece uma vez por ano.
+        # Consolida as datas entre todas as entradas do mesmo nome:
+        adm_min = min((c.admissao for c in candidatos if c.admissao),
+                      default=None)
+        ultimo_ano = max(candidatos,
+                         key=lambda c: (c.ano_referencia or 0,
+                                        c.desligamento or
+                                        datetime(1900, 1, 1).date()))
+        deslig_final = ultimo_ano.desligamento
+        # Se a entrada do ano mais recente não tem desligamento, o vínculo
+        # seguia ativo ao fim daquele ano — não dá para afirmar desligamento.
+        vinculo_ativo = deslig_final is None
 
-        # 3) Demissão divergente
-        if rec.demissao and v.desligamento and rec.demissao != v.desligamento:
-            dias = abs((rec.demissao - v.desligamento).days)
+        # 2) Admissão divergente: só aponta se NENHUMA entrada do CAGED
+        # tiver a mesma data (cobre readmissões)
+        admissoes = {c.admissao for c in candidatos if c.admissao}
+        if rec.admissao and admissoes and rec.admissao not in admissoes:
+            mais_proxima = min(admissoes,
+                               key=lambda d: abs((rec.admissao - d).days))
+            dias = abs((rec.admissao - mais_proxima).days)
+            add(rec, "ADMISSÃO DIVERGENTE", "ALTA" if dias > 5 else "MÉDIA",
+                f"Data de admissão do processo não coincide com nenhuma "
+                f"admissão do CAGED (mais próxima difere {dias} dia(s)).",
+                fmt_data(rec.admissao), fmt_data(mais_proxima))
+
+        # 3) Demissão divergente: idem, contra todos os desligamentos
+        desligamentos = {c.desligamento for c in candidatos if c.desligamento}
+        if rec.demissao and desligamentos and \
+                rec.demissao not in desligamentos:
+            mais_proxima = min(desligamentos,
+                               key=lambda d: abs((rec.demissao - d).days))
+            dias = abs((rec.demissao - mais_proxima).days)
             add(rec, "DEMISSÃO DIVERGENTE", "ALTA" if dias > 5 else "MÉDIA",
-                f"Data de demissão do processo difere do desligamento no CAGED "
-                f"em {dias} dia(s).",
-                fmt_data(rec.demissao), fmt_data(v.desligamento))
+                f"Data de demissão do processo não coincide com nenhum "
+                f"desligamento do CAGED (mais próximo difere {dias} dia(s)).",
+                fmt_data(rec.demissao), fmt_data(mais_proxima))
 
         # 4) Cálculo antes da admissão real
-        if rec.periodo_inicio and v.admissao and rec.periodo_inicio < v.admissao:
-            dias = (v.admissao - rec.periodo_inicio).days
+        if rec.periodo_inicio and adm_min and rec.periodo_inicio < adm_min:
+            dias = (adm_min - rec.periodo_inicio).days
             add(rec, "CÁLCULO ANTES DA ADMISSÃO (CAGED)", "CRÍTICA",
                 f"O cálculo cobra {dias} dia(s) ANTERIORES à admissão registrada "
                 "no CAGED — período sem vínculo empregatício.",
                 f"início do cálculo {fmt_data(rec.periodo_inicio)}",
-                f"admissão CAGED {fmt_data(v.admissao)}")
+                f"admissão CAGED {fmt_data(adm_min)}")
 
         # 5) Cálculo depois do desligamento real
-        if rec.periodo_fim and v.desligamento and rec.periodo_fim > v.desligamento:
-            dias = (rec.periodo_fim - v.desligamento).days
+        if rec.periodo_fim and not vinculo_ativo and \
+                rec.periodo_fim > deslig_final:
+            dias = (rec.periodo_fim - deslig_final).days
             add(rec, "CÁLCULO APÓS O DESLIGAMENTO (CAGED)", "CRÍTICA",
                 f"O cálculo cobra {dias} dia(s) POSTERIORES ao desligamento "
                 "registrado no CAGED — período sem vínculo empregatício.",
                 f"fim do cálculo {fmt_data(rec.periodo_fim)}",
-                f"desligamento CAGED {fmt_data(v.desligamento)}")
+                f"desligamento CAGED {fmt_data(deslig_final)}")
+
+        # 6) e 7): compara mês a mês contra a entrada do ano correspondente
+        # (cada relatório RAIS anual traz as remunerações daquele ano)
+        por_ano = {}
+        for c in candidatos:
+            if c.ano_referencia:
+                por_ano.setdefault(c.ano_referencia, c)
 
         # 6) Salário base x remuneração CAGED
         for mes_ano, salario in rec.historico_salarial.items():
             mm, aaaa = int(mes_ano[:2]), int(mes_ano[3:])
-            if v.ano_referencia == aaaa and mm in v.remuneracoes:
-                remun = v.remuneracoes[mm]
+            c = por_ano.get(aaaa)
+            if c and mm in c.remuneracoes:
+                remun = c.remuneracoes[mm]
                 if remun > 0 and salario > 0:
                     desvio = abs(salario - remun) / salario
                     if desvio > tolerancia_salario:
@@ -824,7 +892,8 @@ def verificar(reclamantes, vinculos, tolerancia_salario=0.05,
 
         # 7) Meses cobrados com remuneração zerada no CAGED
         for (aaaa, mm) in sorted(rec.meses_cobrados):
-            if v.ano_referencia == aaaa and v.remuneracoes.get(mm, None) == 0.0:
+            c = por_ano.get(aaaa)
+            if c and c.remuneracoes.get(mm, None) == 0.0:
                 add(rec, "MÊS COBRADO SEM REMUNERAÇÃO NO CAGED", "ALTA",
                     f"O cálculo cobra verbas em {mm:02d}/{aaaa}, mas o CAGED "
                     "registra remuneração 0,00 nesse mês (sem trabalho "
@@ -1029,7 +1098,8 @@ def main():
     arqs_caged = list(args.caged) if args.caged else []
     if not arq_processo or not arqs_caged:
         print("[0/4] Identificando PDFs automaticamente...")
-        processo_auto, cageds_auto, _ = classificar_pdfs(args.pasta)
+        processo_auto, cageds_auto, _ = classificar_pdfs(
+            args.pasta, pagina_inicial=args.pagina_inicial)
         if not arq_processo:
             arq_processo = processo_auto
         if not arqs_caged:
